@@ -1,0 +1,4 @@
+build/
+prog/*.hex
+*.vcd
+__pycache__/
