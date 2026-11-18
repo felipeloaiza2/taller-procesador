@@ -1,0 +1,170 @@
+INFORME - Taller 3: El hardware se protege solo
+================================================
+Arquitectura de Computadores - Universidad Tecnologica de Pereira
+Integrantes: [completar]
+
+ESTADO FINAL
+  - Los modulos nuevos (pipe_reg, forwarding_unit, hazard_unit y
+    riscv_segmentado) compilan y corren en iverilog.
+  - make seg corre los seis programas contra la referencia (32 registros y 16
+    palabras de memoria cada uno: 288 comprobaciones) y el equipo reporta que
+    todo da PASS, igual que make forwarding y make hazard.
+  - Ademas de iverilog se uso un modelo en Python (tools/modelo.py) que replica
+    la logica del RTL y sirvio para disenar las pruebas.
+  - Los ciclos de la seccion 3 salen de ese modelo; ver la nota alli.
+
+1. QUE SITUACIONES SE PROBARON Y CON QUE PROGRAMA
+-------------------------------------------------
+  Situacion (tabla de la seccion 19)               Donde se prueba
+  -----------------------------------------------  -----------------------------
+  Dependencia dist. 1 y 2, por A y por B           seg_fwd.s (x3,x4,x5,x7,x9)
+  Dist. 3 (lo resuelve el banco)                   seg_fwd.s (x11)
+  Dos escrituras al mismo registro y una lectura   seg_fwd.s (x13, x16)
+  rd = x0 seguido de lectura de x0                 seg_fwd.s (x18, x19, x20)
+  sw con desplazamiento = numero de registro       seg_fwd.s (sw x22,24 -> x25)
+  lui y jal adelantados                            seg_fwd.s (x27, x29, x31)
+  lw seguido de uso por rs1, por rs2, por ambos    seg_carga.s (x6, x8, x10)
+  lw, una independiente, el uso (no debe parar)    seg_carga.s (x13)
+  lw seguido de sw del dato / de un beq            seg_carga.s (Mem[2], x16-x18)
+  lw a x0 y lectura de x0; lui seguido de uso      seg_carga.s (x21, x23)
+  Acumulador con load-use (parada sin burbuja)     seg_carga.s (x24 = 15, no 23)
+  Salto tomado con dos ranuras visibles            seg_saltos.s (x30, Mem[4])
+  jal, jalr y bucle (9 saltos hacia atras)         seg_saltos.s
+  Regresion del Taller 2                           humo.s, completo.s, bytes.s
+  ForwardAE y ForwardBE, las 8 filas + barrido     tb_forwarding.sv
+  Tabla de la unidad de riesgos + ResultSrcE=11    tb_hazard.sv
+  Los 6 programas contra la referencia ISA         tb_segmentado.sv
+
+  Como saber que las pruebas son buenas: tools/mutantes.py inyecta en el modelo
+  13 defectos (los de la seccion 19 y alguno mas) y comprueba que algun programa
+  delata cada uno. Resultado: 0 huecos.   (make modelo)
+
+2. QUE SALIO MAL POR EL CAMINO Y COMO SE ENCONTRO
+-------------------------------------------------
+
+  A) PROBLEMAS QUE APARECIERON AL SIMULAR
+
+  1. Primera simulacion: 91 errores de 288, todos con valores X.
+     Sintoma: en todos los programas (incluso humo, el mas simple) los registros
+     salian como 0x0000000X o 0xxxxxxxxx en lugar de un numero.
+     Pista que dio la causa: no estaba en las lineas FALLO sino en el log de
+     compilacion, una linea antes:
+         rtl/riscv_segmentado.sv:402: warning: implicit definition of wire 'RES_MEM'
+     Causa: la constante RES_MEM esta en riscv_pkg y se uso dentro de una conexion
+     de puerto (.sel (result_src_w == RES_MEM)) del multiplexor de la etapa WB.
+     iverilog no resuelve el nombre del paquete en ese lugar y lo toma por un
+     cable nuevo sin ningun driver (valor Z). Con el selector indeterminado, el
+     mux de WB devolvia X, y como todo lo que se escribe en el banco de
+     registros pasa por ese mux, todo el banco se llenaba de X. Un solo error
+     explicaba los 91 fallos.
+     Solucion: sacar la comparacion de la conexion y calcularla en una senal
+     local:
+         logic es_load_w;
+         assign es_load_w = (result_src_w == RES_MEM);
+         ... .sel (es_load_w) ...
+     Por que no se vio antes: el modelo en Python no tiene este problema, es una
+     particularidad del simulador. Tampoco lo tenia hazard_unit, que usa RES_MEM
+     en un assign dentro del modulo (ahi si resuelve el nombre).
+     Leccion: un warning de compilacion puede ser el error real. Se lee el
+     primero antes de mirar los FALLO.
+
+  2. "Cambie el codigo y sale lo mismo."
+     Tras corregir, make seg seguia dando las mismas 91 fallas. La salida no
+     mostraba ninguna linea de iverilog (no recompilo), y al imprimir las lineas
+     395-412 del archivo con sed, la 402 seguia siendo la version vieja: el
+     cambio no estaba en el archivo que make usaba (se habia editado otra copia
+     o no se habia guardado).
+     Solucion: aplicar el cambio con un script desde la carpeta correcta,
+     verificar con grep -n "es_load_w" rtl/riscv_segmentado.sv (deben salir tres
+     lineas) y correr make clean antes de make seg.
+     Leccion: antes de depurar el codigo, comprobar que el simulador esta
+     leyendo el codigo que uno cree.
+
+  3. Avisos que NO son errores (se descartaron a proposito):
+       data_memory.sv:77: sorry: constant selects in always_* processes ...
+         -> limitacion de iverilog con la memoria del Taller 2. No afecta.
+       $readmemh(prog/x.hex): Not enough words in the file for [0:255]
+         -> el programa es mas corto que la memoria (256 palabras). Normal.
+
+  B) PROBLEMAS DE DISENO ENCONTRADOS ANALIZANDO LA GUIA Y EL TALLER 2
+
+  4. El banco de registros no hace lo que dice la guia. La seccion 5 supone que
+     escribe en el primer medio ciclo; el register_file.sv del Taller 2 escribe
+     en el flanco de SUBIDA. Con ese banco, la dependencia a distancia 3 lee el
+     valor viejo. Se vio al razonar el diagrama de la seccion 4 contra el codigo
+     y lo confirma el defecto inyectado "rf_posedge" (falla completo, seg_fwd y
+     seg_saltos). Solucion sin tocar el modulo: instanciarlo con el reloj
+     invertido (clk_n), de modo que escribe a mitad de ciclo.
+
+  5. funct3 no esta en la tabla de la seccion 2, pero hace falta: la memoria de
+     datos lo usa en MEM (lb/lh/lw/sb/sh/sw) y el salto en EX (beq/bne/blt...).
+     Viaja por ID/EX y EX/MEM. Tampoco aparece jalr entre las senales de EX.
+
+  6. control_unit.sv calcula pc_src con las banderas de la ALU, que en ID no
+     existen todavia. Se instancia en ID con las banderas a 0 (se ignora su
+     pc_src) y la decision del salto se toma en EX con la misma tabla del bloque
+     3 de control_unit.
+
+  C) PROBLEMAS DE LAS PRUEBAS
+
+  7. Una prueba floja: la primera version del acumulador de seg_carga.s NO
+     delataba "parar sin vaciar ID/EX", porque la instruccion duplicada daba el
+     mismo resultado por casualidad (el defecto inyectado pasaba sin ser
+     detectado). Se cambio para que la primera ejecucion adelante la direccion
+     (8) y la segunda el dato (15): ahora da 23 en vez de 15. Lo encontro
+     tools/mutantes.py.
+
+  8. ResultSrcE de un solo bit (version del libro) solo cuesta ciclos y ningun
+     programa lo detecta: el defecto "bit0" aparece como "solo ciclos". Lo cubre
+     tb_hazard.sv, con ResultSrcE = 11 y una dependencia.
+
+  9. Efecto de seguir la tabla al pie de la letra: la unidad de riesgos compara
+     rs1D/rs2D aunque la instruccion de ID no use ese operando (addi, lw, lui y
+     jal usan bits del inmediato como "rs2"), y no excluye rd_e = x0. Puede
+     parar de mas en casos raros. Es correcto y es lo que la tabla especifica;
+     una mejora seria decodificar que operandos se usan de verdad.
+
+  10. Error de conteo en mi propio modelo. Al preparar la comprobacion de ciclos,
+     se vio que el modelo de Python contaba 2 ciclos DE MAS en cada programa:
+     tras el beq final esperaba 4 ciclos para retirarlo y solo le faltan 2
+     (MEM y WB). La primera version de la tabla de ciclos (11, 36, 22, 50, 46,
+     84) estaba mal. Se encontro comparando tres formas de contar:
+         ciclos = ciclo en que el beq final esta en IF + 4
+         ciclos = N + 4 + paradas load-use + 2 x (saltos tomados sin el beq final)
+         ciclos = lo que devolvia el modelo
+     que no coincidian entre si. Ademas, seg_fwd y seg_carga buscan el beq final
+     dos veces (una en el camino equivocado, que luego se vacia), asi que "la
+     primera vez que el PC llega a fin" da un conteo erroneo: por eso
+     tb_ciclos.sv mide en EX (pc_e), donde no puede haber camino equivocado.
+     Leccion: un numero sacado de un modelo se confirma con una medida
+     independiente antes de ponerlo en un informe.
+
+3. CICLOS: SEGMENTADO FRENTE AL MONOCICLO
+-----------------------------------------
+  Se miden con:   make ciclos     (tb/tb_ciclos.sv)
+
+  Programa      Monociclo   Segmentado   Segmentado   Paradas   Saltos
+                            (modelo)     (medido)     load-use  tomados*
+  humo               5           9        [completar]     0         0
+  completo          24          34        [completar]     0         3
+  bytes             16          20        [completar]     0         0
+  seg_fwd           42          48        [completar]     0         1
+  seg_carga         30          44        [completar]     8         1
+  seg_saltos        50          82        [completar]     0        14
+
+  * sin contar el beq final, que se toma a si mismo pero no cuesta ciclos
+    (ya no queda nada despues que retirar).
+
+  Monociclo = instrucciones ejecutadas hasta el bucle fin (1 por ciclo).
+  Segmentado = ciclos desde que se busca la instruccion de la direccion 0 hasta
+  que se retira el beq final:
+        ciclos = N + 4 + paradas load-use + 2 x saltos tomados
+  donde N es el numero de instrucciones ejecutadas, 4 son los ciclos de
+  llenado del pipeline, 1 cuesta cada load-use y 2 cada salto o jal tomado.
+  Ejemplo, completo.s:  24 + 4 + 0 + 2 x 3 = 34.
+
+  El segmentado gasta MAS ciclos en programas cortos y con muchos saltos: eso es
+  normal. Lo que se compra es el periodo de reloj (el camino mas largo pasa de
+  las cinco etapas juntas a una sola), y eso no se ve en este conteo. Para
+  completo.s: 34/24 = 1,42 ciclos por instruccion del monociclo, y el reloj de
+  un segmentado ideal es hasta ~5 veces mas rapido.
